@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+src/trace_event_stats/__init__.py
+src/trace_event_stats/core.py
+src/trace_event_stats/py.typed
+src/trace_event_stats.egg-info/PKG-INFO
+src/trace_event_stats.egg-info/SOURCES.txt
+src/trace_event_stats.egg-info/dependency_links.txt
+src/trace_event_stats.egg-info/top_level.txt
+tests/test_trace_event_stats.py

@@ -1,0 +1,35 @@
+# trace-event-stats
+
+Aggregate stats from agent JSONL trace events. Zero dependencies.
+
+## Install
+
+```bash
+pip install trace-event-stats
+```
+
+## Usage
+
+```python
+from trace_event_stats import compute_stats, stats_file
+
+# From a list of event dicts
+stats = compute_stats(events)
+
+# From a JSONL trace file
+stats = stats_file("traces.jsonl")
+
+print(stats.event_count)         # 1000
+print(stats.total_tokens_in)     # 450000
+print(stats.total_cost_usd)      # 1.23
+print(stats.p95_duration_ms)     # 850.0
+print(stats.summary())
+
+# Filter by kind
+llm_stats = stats.by_kind("llm_call")
+tool_stats = stats.by_kind("tool_call")
+```
+
+## Zero dependencies
+
+Standard library only: `json`, `math`, `dataclasses`, `pathlib`. Nothing else.
