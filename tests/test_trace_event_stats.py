@@ -1,282 +1,316 @@
-"""Tests for trace-event-stats."""
+"""Tests for trace-event-stats.
+
+Uses the Python standard-library ``unittest`` framework only — no
+third-party test dependencies. Run with::
+
+    python -m unittest discover -s tests
+"""
 
 import json
+import os
+import sys
 import tempfile
+import unittest
 from pathlib import Path
 
-import pytest
+# Make the ``src`` layout package importable without an editable/pip install,
+# so the suite runs under a bare ``python -m unittest discover -s tests``.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 from trace_event_stats import DistStats, EventStats, compute_stats, stats_file
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def make_events(*overrides):
-    """Build a list of events from keyword dicts."""
-    return list(overrides)
 
 
 BASE = {"tokens_in": 100, "tokens_out": 50, "cost_usd": 0.01, "duration_ms": 200}
 
 
-# ---------------------------------------------------------------------------
-# compute_stats — basic
-# ---------------------------------------------------------------------------
+class ComputeStatsBasicTests(unittest.TestCase):
+    def test_empty_events(self):
+        stats = compute_stats([])
+        self.assertEqual(stats.event_count, 0)
+        self.assertEqual(stats.total_tokens, 0)
+        self.assertEqual(stats.total_cost_usd, 0.0)
+        self.assertEqual(stats.error_count, 0)
+        self.assertEqual(stats.kinds, [])
+        self.assertEqual(stats.models, [])
 
-def test_empty_events():
-    stats = compute_stats([])
-    assert stats.event_count == 0
-    assert stats.total_tokens == 0
-    assert stats.total_cost_usd == 0.0
-    assert stats.error_count == 0
+    def test_single_event(self):
+        stats = compute_stats([BASE])
+        self.assertEqual(stats.event_count, 1)
+        self.assertEqual(stats.total_tokens_in, 100)
+        self.assertEqual(stats.total_tokens_out, 50)
+        self.assertEqual(stats.total_tokens, 150)
 
-def test_single_event():
-    stats = compute_stats([BASE])
-    assert stats.event_count == 1
-    assert stats.total_tokens_in == 100
-    assert stats.total_tokens_out == 50
-    assert stats.total_tokens == 150
+    def test_total_cost(self):
+        stats = compute_stats([{"cost_usd": 0.01}, {"cost_usd": 0.02}])
+        self.assertAlmostEqual(stats.total_cost_usd, 0.03)
 
-def test_total_cost():
-    events = [{"cost_usd": 0.01}, {"cost_usd": 0.02}]
-    stats = compute_stats(events)
-    assert stats.total_cost_usd == pytest.approx(0.03)
+    def test_tokens_totals(self):
+        events = [
+            {"tokens_in": 100, "tokens_out": 50},
+            {"tokens_in": 200, "tokens_out": 100},
+        ]
+        stats = compute_stats(events)
+        self.assertEqual(stats.total_tokens_in, 300)
+        self.assertEqual(stats.total_tokens_out, 150)
+        self.assertEqual(stats.total_tokens, 450)
 
-def test_tokens_totals():
-    events = [
-        {"tokens_in": 100, "tokens_out": 50},
-        {"tokens_in": 200, "tokens_out": 100},
-    ]
-    stats = compute_stats(events)
-    assert stats.total_tokens_in == 300
-    assert stats.total_tokens_out == 150
-    assert stats.total_tokens == 450
+    def test_event_count(self):
+        stats = compute_stats([BASE, BASE, BASE])
+        self.assertEqual(stats.event_count, 3)
 
-def test_event_count():
-    events = [BASE, BASE, BASE]
-    stats = compute_stats(events)
-    assert stats.event_count == 3
+    def test_returns_event_stats_instance(self):
+        self.assertIsInstance(compute_stats([BASE]), EventStats)
 
-# ---------------------------------------------------------------------------
-# Variant field names accepted
-# ---------------------------------------------------------------------------
+    def test_numeric_string_values_are_coerced(self):
+        # _first_float coerces numeric strings (e.g. CSV-derived traces).
+        stats = compute_stats([{"cost_usd": "0.01"}, {"cost_usd": 0.02}])
+        self.assertAlmostEqual(stats.total_cost_usd, 0.03)
 
-def test_accepts_input_tokens_variant():
-    stats = compute_stats([{"input_tokens": 77}])
-    assert stats.total_tokens_in == 77
+    def test_non_numeric_values_are_ignored(self):
+        stats = compute_stats([{"tokens_in": "lots"}])
+        self.assertEqual(stats.tokens_in.count, 0)
+        self.assertEqual(stats.total_tokens_in, 0)
 
-def test_accepts_prompt_tokens_variant():
-    stats = compute_stats([{"prompt_tokens": 88}])
-    assert stats.total_tokens_in == 88
 
-def test_accepts_completion_tokens_variant():
-    stats = compute_stats([{"completion_tokens": 30}])
-    assert stats.total_tokens_out == 30
+class VariantFieldNameTests(unittest.TestCase):
+    def test_accepts_input_tokens_variant(self):
+        self.assertEqual(compute_stats([{"input_tokens": 77}]).total_tokens_in, 77)
 
-def test_accepts_output_tokens_variant():
-    stats = compute_stats([{"output_tokens": 40}])
-    assert stats.total_tokens_out == 40
+    def test_accepts_prompt_tokens_variant(self):
+        self.assertEqual(compute_stats([{"prompt_tokens": 88}]).total_tokens_in, 88)
 
-def test_accepts_cost_variant():
-    stats = compute_stats([{"cost": 0.005}])
-    assert stats.total_cost_usd == pytest.approx(0.005)
+    def test_accepts_completion_tokens_variant(self):
+        self.assertEqual(compute_stats([{"completion_tokens": 30}]).total_tokens_out, 30)
 
-def test_accepts_latency_ms_variant():
-    stats = compute_stats([{"latency_ms": 300}])
-    assert stats.mean_duration_ms == pytest.approx(300.0)
+    def test_accepts_output_tokens_variant(self):
+        self.assertEqual(compute_stats([{"output_tokens": 40}]).total_tokens_out, 40)
 
-def test_accepts_elapsed_ms_variant():
-    stats = compute_stats([{"elapsed_ms": 400}])
-    assert stats.duration_ms.count == 1
+    def test_accepts_cost_variant(self):
+        self.assertAlmostEqual(compute_stats([{"cost": 0.005}]).total_cost_usd, 0.005)
 
-# ---------------------------------------------------------------------------
-# kind + model
-# ---------------------------------------------------------------------------
+    def test_accepts_price_usd_variant(self):
+        self.assertAlmostEqual(compute_stats([{"price_usd": 0.007}]).total_cost_usd, 0.007)
 
-def test_kinds_collected():
-    events = [
-        {"kind": "llm_call", "tokens_in": 10},
-        {"kind": "tool_call", "tokens_in": 5},
-        {"kind": "llm_call", "tokens_in": 20},
-    ]
-    stats = compute_stats(events)
-    assert "llm_call" in stats.kinds
-    assert "tool_call" in stats.kinds
-    assert len(stats.kinds) == 2
+    def test_accepts_latency_ms_variant(self):
+        self.assertAlmostEqual(compute_stats([{"latency_ms": 300}]).mean_duration_ms, 300.0)
 
-def test_kinds_sorted():
-    events = [{"kind": "z"}, {"kind": "a"}, {"kind": "m"}]
-    stats = compute_stats(events)
-    assert stats.kinds == ["a", "m", "z"]
+    def test_accepts_elapsed_ms_variant(self):
+        self.assertEqual(compute_stats([{"elapsed_ms": 400}]).duration_ms.count, 1)
 
-def test_models_collected():
-    events = [{"model": "claude-sonnet-4-5"}, {"model": "gpt-5.4"}]
-    stats = compute_stats(events)
-    assert "claude-sonnet-4-5" in stats.models
-    assert "gpt-5.4" in stats.models
+    def test_canonical_name_wins_over_variant(self):
+        # tokens_in is checked before input_tokens, so it takes precedence.
+        stats = compute_stats([{"tokens_in": 100, "input_tokens": 999}])
+        self.assertEqual(stats.total_tokens_in, 100)
 
-def test_accepts_event_type_as_kind():
-    events = [{"event_type": "llm_call"}]
-    stats = compute_stats(events)
-    assert "llm_call" in stats.kinds
 
-def test_accepts_model_id_variant():
-    events = [{"model_id": "claude-haiku"}]
-    stats = compute_stats(events)
-    assert "claude-haiku" in stats.models
+class KindModelTests(unittest.TestCase):
+    def test_kinds_collected(self):
+        events = [
+            {"kind": "llm_call", "tokens_in": 10},
+            {"kind": "tool_call", "tokens_in": 5},
+            {"kind": "llm_call", "tokens_in": 20},
+        ]
+        stats = compute_stats(events)
+        self.assertIn("llm_call", stats.kinds)
+        self.assertIn("tool_call", stats.kinds)
+        self.assertEqual(len(stats.kinds), 2)
 
-# ---------------------------------------------------------------------------
-# error counting
-# ---------------------------------------------------------------------------
+    def test_kinds_sorted(self):
+        stats = compute_stats([{"kind": "z"}, {"kind": "a"}, {"kind": "m"}])
+        self.assertEqual(stats.kinds, ["a", "m", "z"])
 
-def test_error_count():
-    events = [
-        {"error": "timeout"},
-        {"error": None},
-        {"tokens_in": 5},
-    ]
-    stats = compute_stats(events)
-    assert stats.error_count == 1
+    def test_models_collected(self):
+        stats = compute_stats([{"model": "claude-sonnet-4-5"}, {"model": "gpt-5.4"}])
+        self.assertIn("claude-sonnet-4-5", stats.models)
+        self.assertIn("gpt-5.4", stats.models)
 
-def test_error_via_err_field():
-    events = [{"err": "connection refused"}]
-    stats = compute_stats(events)
-    assert stats.error_count == 1
+    def test_accepts_event_type_as_kind(self):
+        self.assertIn("llm_call", compute_stats([{"event_type": "llm_call"}]).kinds)
 
-def test_no_errors():
-    stats = compute_stats([BASE])
-    assert stats.error_count == 0
+    def test_accepts_type_as_kind(self):
+        self.assertIn("span", compute_stats([{"type": "span"}]).kinds)
 
-def test_errors_returns_list():
-    events = [{"error": "bad"}, BASE]
-    stats = compute_stats(events)
-    errs = stats.errors()
-    assert len(errs) == 1
+    def test_accepts_model_id_variant(self):
+        self.assertIn("claude-haiku", compute_stats([{"model_id": "claude-haiku"}]).models)
 
-# ---------------------------------------------------------------------------
-# DistStats
-# ---------------------------------------------------------------------------
+    def test_non_string_kind_ignored(self):
+        self.assertEqual(compute_stats([{"kind": 123}]).kinds, [])
 
-def test_dist_stats_empty():
-    d = DistStats.from_values([])
-    assert d.count == 0
-    assert d.total == 0.0
-    assert d.min is None
-    assert d.mean is None
 
-def test_dist_stats_single():
-    d = DistStats.from_values([42.0])
-    assert d.count == 1
-    assert d.total == 42.0
-    assert d.min == 42.0
-    assert d.max == 42.0
-    assert d.mean == 42.0
+class ErrorCountingTests(unittest.TestCase):
+    def test_error_count(self):
+        events = [{"error": "timeout"}, {"error": None}, {"tokens_in": 5}]
+        self.assertEqual(compute_stats(events).error_count, 1)
 
-def test_dist_stats_mean():
-    d = DistStats.from_values([10.0, 20.0, 30.0])
-    assert d.mean == pytest.approx(20.0)
+    def test_error_via_err_field(self):
+        self.assertEqual(compute_stats([{"err": "connection refused"}]).error_count, 1)
 
-def test_dist_stats_p50():
-    d = DistStats.from_values([1.0, 2.0, 3.0])
-    assert d.p50 == pytest.approx(2.0)
+    def test_error_via_exception_field(self):
+        self.assertEqual(compute_stats([{"exception": "ValueError"}]).error_count, 1)
 
-def test_dist_stats_p95_basic():
-    values = list(range(1, 101, 1))  # 1..100
-    d = DistStats.from_values([float(v) for v in values])
-    assert d.p95 == pytest.approx(95.05, abs=1.0)
+    def test_no_errors(self):
+        self.assertEqual(compute_stats([BASE]).error_count, 0)
 
-def test_dist_stats_min_max():
-    d = DistStats.from_values([5.0, 1.0, 9.0, 3.0])
-    assert d.min == 1.0
-    assert d.max == 9.0
+    def test_errors_returns_list(self):
+        stats = compute_stats([{"error": "bad"}, BASE])
+        self.assertEqual(len(stats.errors()), 1)
 
-# ---------------------------------------------------------------------------
-# by_kind + by_model filtering
-# ---------------------------------------------------------------------------
+    def test_falsy_error_not_counted(self):
+        self.assertEqual(compute_stats([{"error": ""}, {"error": 0}]).error_count, 0)
 
-def test_by_kind_filters():
-    events = [
-        {"kind": "llm_call", "tokens_in": 100},
-        {"kind": "tool_call", "tokens_in": 5},
-    ]
-    stats = compute_stats(events)
-    llm_stats = stats.by_kind("llm_call")
-    assert llm_stats.event_count == 1
-    assert llm_stats.total_tokens_in == 100
 
-def test_by_kind_empty():
-    events = [{"kind": "llm_call", "tokens_in": 100}]
-    stats = compute_stats(events)
-    none_stats = stats.by_kind("nonexistent")
-    assert none_stats.event_count == 0
+class DistStatsTests(unittest.TestCase):
+    def test_empty(self):
+        d = DistStats.from_values([])
+        self.assertEqual(d.count, 0)
+        self.assertEqual(d.total, 0.0)
+        self.assertIsNone(d.min)
+        self.assertIsNone(d.max)
+        self.assertIsNone(d.mean)
+        self.assertIsNone(d.p50)
+        self.assertIsNone(d.p99)
 
-def test_by_model_filters():
-    events = [
-        {"model": "claude-sonnet-4-5", "cost_usd": 0.01},
-        {"model": "gpt-5.4", "cost_usd": 0.02},
-    ]
-    stats = compute_stats(events)
-    claude_stats = stats.by_model("claude-sonnet-4-5")
-    assert claude_stats.total_cost_usd == pytest.approx(0.01)
+    def test_single(self):
+        d = DistStats.from_values([42.0])
+        self.assertEqual(d.count, 1)
+        self.assertEqual(d.total, 42.0)
+        self.assertEqual(d.min, 42.0)
+        self.assertEqual(d.max, 42.0)
+        self.assertEqual(d.mean, 42.0)
+        # With a single data point every percentile collapses to that value.
+        self.assertEqual(d.p50, 42.0)
+        self.assertEqual(d.p95, 42.0)
 
-# ---------------------------------------------------------------------------
-# convenience properties
-# ---------------------------------------------------------------------------
+    def test_mean(self):
+        self.assertAlmostEqual(DistStats.from_values([10.0, 20.0, 30.0]).mean, 20.0)
 
-def test_mean_duration_ms_none_when_empty():
-    stats = compute_stats([{"tokens_in": 5}])  # no duration field
-    assert stats.mean_duration_ms is None
+    def test_p50_is_median(self):
+        self.assertAlmostEqual(DistStats.from_values([1.0, 2.0, 3.0]).p50, 2.0)
 
-def test_p95_duration_ms():
-    events = [{"duration_ms": float(i)} for i in range(1, 101)]
-    stats = compute_stats(events)
-    assert stats.p95_duration_ms is not None
-    assert stats.p95_duration_ms > 90
+    def test_p50_even_count_interpolates(self):
+        # Linear-interpolation median of [1,2,3,4] sits halfway between 2 and 3.
+        self.assertAlmostEqual(DistStats.from_values([1.0, 2.0, 3.0, 4.0]).p50, 2.5)
 
-# ---------------------------------------------------------------------------
-# summary string
-# ---------------------------------------------------------------------------
+    def test_p95_basic(self):
+        values = [float(v) for v in range(1, 101)]  # 1..100
+        self.assertAlmostEqual(DistStats.from_values(values).p95, 95.05, delta=1.0)
 
-def test_summary_not_empty():
-    stats = compute_stats([BASE])
-    s = stats.summary()
-    assert "events" in s
-    assert "tokens_in" in s
+    def test_p99_high(self):
+        values = [float(v) for v in range(1, 101)]
+        d = DistStats.from_values(values)
+        self.assertGreater(d.p99, 98.0)
+        self.assertLessEqual(d.p99, 100.0)
 
-def test_summary_contains_cost():
-    stats = compute_stats([{"cost_usd": 0.123456}])
-    s = stats.summary()
-    assert "0.123456" in s
+    def test_min_max(self):
+        d = DistStats.from_values([5.0, 1.0, 9.0, 3.0])
+        self.assertEqual(d.min, 1.0)
+        self.assertEqual(d.max, 9.0)
 
-# ---------------------------------------------------------------------------
-# stats_file
-# ---------------------------------------------------------------------------
+    def test_total_sums_values(self):
+        self.assertAlmostEqual(DistStats.from_values([1.5, 2.5, 4.0]).total, 8.0)
 
-def test_stats_file_basic():
-    events = [BASE, {"tokens_in": 50, "cost_usd": 0.005}]
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        for e in events:
-            f.write(json.dumps(e) + "\n")
-        path = f.name
-    stats = stats_file(path)
-    assert stats.event_count == 2
+    def test_percentiles_are_monotonic(self):
+        d = DistStats.from_values([float(v) for v in range(1, 1001)])
+        self.assertLessEqual(d.p50, d.p90)
+        self.assertLessEqual(d.p90, d.p95)
+        self.assertLessEqual(d.p95, d.p99)
 
-def test_stats_file_skips_blank_lines():
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps(BASE) + "\n")
-        f.write("\n")
-        f.write(json.dumps(BASE) + "\n")
-        path = f.name
-    stats = stats_file(path)
-    assert stats.event_count == 2
 
-def test_stats_file_skips_malformed():
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps(BASE) + "\n")
-        f.write("NOT JSON\n")
-        f.write(json.dumps(BASE) + "\n")
-        path = f.name
-    stats = stats_file(path)
-    assert stats.event_count == 2
+class FilteringTests(unittest.TestCase):
+    def test_by_kind_filters(self):
+        events = [
+            {"kind": "llm_call", "tokens_in": 100},
+            {"kind": "tool_call", "tokens_in": 5},
+        ]
+        llm = compute_stats(events).by_kind("llm_call")
+        self.assertEqual(llm.event_count, 1)
+        self.assertEqual(llm.total_tokens_in, 100)
+
+    def test_by_kind_empty(self):
+        stats = compute_stats([{"kind": "llm_call", "tokens_in": 100}])
+        self.assertEqual(stats.by_kind("nonexistent").event_count, 0)
+
+    def test_by_kind_returns_event_stats(self):
+        stats = compute_stats([{"kind": "llm_call"}])
+        self.assertIsInstance(stats.by_kind("llm_call"), EventStats)
+
+    def test_by_model_filters(self):
+        events = [
+            {"model": "claude-sonnet-4-5", "cost_usd": 0.01},
+            {"model": "gpt-5.4", "cost_usd": 0.02},
+        ]
+        claude = compute_stats(events).by_model("claude-sonnet-4-5")
+        self.assertAlmostEqual(claude.total_cost_usd, 0.01)
+
+    def test_by_model_empty(self):
+        stats = compute_stats([{"model": "claude-sonnet-4-5"}])
+        self.assertEqual(stats.by_model("unknown").event_count, 0)
+
+
+class ConveniencePropertyTests(unittest.TestCase):
+    def test_mean_duration_ms_none_when_empty(self):
+        self.assertIsNone(compute_stats([{"tokens_in": 5}]).mean_duration_ms)
+
+    def test_p95_duration_ms(self):
+        events = [{"duration_ms": float(i)} for i in range(1, 101)]
+        stats = compute_stats(events)
+        self.assertIsNotNone(stats.p95_duration_ms)
+        self.assertGreater(stats.p95_duration_ms, 90)
+
+    def test_total_tokens_in_is_int(self):
+        self.assertIsInstance(compute_stats([{"tokens_in": 100}]).total_tokens_in, int)
+
+
+class SummaryTests(unittest.TestCase):
+    def test_summary_not_empty(self):
+        s = compute_stats([BASE]).summary()
+        self.assertIn("events", s)
+        self.assertIn("tokens_in", s)
+
+    def test_summary_contains_cost(self):
+        s = compute_stats([{"cost_usd": 0.123456}]).summary()
+        self.assertIn("0.123456", s)
+
+    def test_summary_includes_duration_lines_when_present(self):
+        s = compute_stats([BASE]).summary()
+        self.assertIn("dur_ms p50", s)
+
+    def test_summary_omits_duration_lines_when_absent(self):
+        s = compute_stats([{"tokens_in": 5}]).summary()
+        self.assertNotIn("dur_ms", s)
+
+
+class StatsFileTests(unittest.TestCase):
+    def _write_jsonl(self, lines):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_basic(self):
+        path = self._write_jsonl(
+            [json.dumps(BASE), json.dumps({"tokens_in": 50, "cost_usd": 0.005})]
+        )
+        self.assertEqual(stats_file(path).event_count, 2)
+
+    def test_skips_blank_lines(self):
+        path = self._write_jsonl([json.dumps(BASE), "", json.dumps(BASE)])
+        self.assertEqual(stats_file(path).event_count, 2)
+
+    def test_skips_malformed(self):
+        path = self._write_jsonl([json.dumps(BASE), "NOT JSON", json.dumps(BASE)])
+        self.assertEqual(stats_file(path).event_count, 2)
+
+    def test_aggregates_values_from_file(self):
+        path = self._write_jsonl(
+            [json.dumps({"cost_usd": 0.01}), json.dumps({"cost_usd": 0.02})]
+        )
+        self.assertAlmostEqual(stats_file(path).total_cost_usd, 0.03)
+
+
+if __name__ == "__main__":
+    unittest.main()
